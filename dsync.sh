@@ -180,28 +180,24 @@ check_space_requirements() {
     local to_update=$(echo "$changes" | grep "^.f....." | wc -l)
     local to_delete=$(echo "$changes" | grep "^\*deleting" | wc -l)
     
-    # Only calculate size if we have files to add or update
-    local total_size=0
-    if (( to_add > 0 || to_update > 0 )); then
-        # Get size of files to be transferred
-        local rsync_stats=$(eval "rsync -ain --delete --ignore-errors $(get_rsync_excludes) --stats \"$source/\" \"$dest/\"" 2>/dev/null)
-        total_size=$(echo "$rsync_stats" | grep "Total file size:" | sed 's/,//g' | awk '{print $4}')
-        
-        if [ -z "$total_size" ] || [ "$total_size" = "0" ]; then
-            # Fallback to calculating only the size of files that need to be transferred
-            total_size=0
-            while read -r file; do
-                if [[ "$file" == ">f"* ]]; then
-                    local filepath="${source}/${file#>f* }"
-                    local size=$(du -b "$filepath" 2>/dev/null | cut -f1)
-                    total_size=$((total_size + size))
+    # Calculate size of only the files that need to be transferred
+    local transfer_size=0
+    while IFS= read -r line; do
+        # Check for new or modified files
+        if [[ $line == ">f"* ]] || [[ $line == ".f"* ]]; then
+            local file_path=$(echo "$line" | sed 's/^[^[:space:]]\+[[:space:]]\+//')
+            if [[ -f "${source}/${file_path}" ]]; then
+                # Use du instead of stat for more reliable size calculation
+                local file_size=$(du -b "${source}/${file_path}" 2>/dev/null | cut -f1)
+                if [[ -n "$file_size" ]] && [[ "$file_size" =~ ^[0-9]+$ ]]; then
+                    transfer_size=$((transfer_size + file_size))
                 fi
-            done <<< "$changes"
+            fi
         fi
-    fi
+    done < <(echo "$changes")
     
     # Calculate required space with safety margin
-    local required_bytes=$(echo "$total_size * $safety_margin" | bc | cut -d. -f1)
+    local required_bytes=$(echo "$transfer_size * $safety_margin" | bc | cut -d. -f1)
     
     # Get available space on destination
     local available_bytes=$(df --output=avail -B 1 "$dest" | tail -n 1)
@@ -213,13 +209,20 @@ check_space_requirements() {
     echo "   • Files to update:  $to_update"
     echo "   • Files to delete:  $to_delete"
     
-    if (( available_bytes >= required_bytes )); then
-        echo "   Status:            ✓ Sufficient space"
-        return 0
+    # Check if we actually need to transfer data
+    if (( to_add > 0 || to_update > 0 )); then
+        if (( available_bytes >= required_bytes )); then
+            echo "   Status:            ✓ Sufficient space"
+            return 0
+        else
+            local needed_more=$((required_bytes - available_bytes))
+            echo "   Status:            ✗ Insufficient space (need $(convert_to_human $needed_more) more)"
+            return 1
+        fi
     else
-        local needed_more=$((required_bytes - available_bytes))
-        echo "   Status:            ✗ Insufficient space (need $(convert_to_human $needed_more) more)"
-        return 1
+        # If no files need to be transferred, consider it sufficient
+        echo "   Status:            ✓ No space needed (no files to transfer)"
+        return 0
     fi
 }
 
